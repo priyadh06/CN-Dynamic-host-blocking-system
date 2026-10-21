@@ -1,0 +1,5 @@
+[10:44:04] h4-abnormal: rate=5.0/s duration=20.0s target=10.0.0.1:5000
+[10:44:09] h4-abnormal: ok=26 fail=0
+[10:44:14] h4-abnormal: ok=52 fail=0
+[10:44:19] h4-abnormal: ok=78 fail=0
+[10:44:24] h4-abnormal DONE: attempts=100 ok=100 fail=0 elapsed=20.0s avg_rate=5.00/s

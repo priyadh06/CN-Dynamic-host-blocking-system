@@ -1,0 +1,5 @@
+[10:44:04] h3-normal: rate=1.0/s duration=20.0s target=10.0.0.1:5000
+[10:44:09] h3-normal: ok=6 fail=0
+[10:44:15] h3-normal: ok=12 fail=0
+[10:44:21] h3-normal: ok=18 fail=0
+[10:44:24] h3-normal DONE: attempts=20 ok=20 fail=0 elapsed=20.0s avg_rate=1.00/s
