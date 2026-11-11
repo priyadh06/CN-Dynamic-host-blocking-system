@@ -18,6 +18,7 @@ Configuration (environment variables, all optional)
   DHBS_THRESHOLD_PPS  packets/sec that is "abnormal"   (default 12)
   DHBS_POLL           stats polling interval, seconds  (default 2)
   DHBS_STRIKES        consecutive windows above threshold before blocking (default 1)
+  DHBS_BLOCK_SECONDS  temporary block duration; 0 means permanent (default 30)
   DHBS_SERVER_IP      server that is never blocked     (default 10.0.0.1)
   DHBS_OUT_DIR        where the CSV files are written  (default <repo>/results)
 
@@ -55,18 +56,23 @@ class DHBSController(BaseClass):
         self.threshold = float(env("DHBS_THRESHOLD_PPS", "12"))
         self.poll = float(env("DHBS_POLL", "2"))
         self.strikes_needed = int(env("DHBS_STRIKES", "1"))
+        self.block_seconds = float(env("DHBS_BLOCK_SECONDS", "30"))
         self.server_ip = env("DHBS_SERVER_IP", "10.0.0.1")
+        if self.threshold <= 0 or self.poll <= 0 or self.strikes_needed < 1 or self.block_seconds < 0 or self.block_seconds > 65535:
+            raise ValueError("DHBS_THRESHOLD_PPS and DHBS_POLL must be > 0; "
+                             "DHBS_STRIKES must be >= 1; DHBS_BLOCK_SECONDS must be between 0 and 65535")
 
         self.mac_to_port = {}
         self.datapaths = {}
         self.blocklist = set()
+        self.blocked_until = {}  # ip -> (datapath id, monotonic expiry); absent for permanent blocks
         self.detected = set()
         self.last_total = {}     # ip -> (packet_total, timestamp)
         self.strikes = {}        # ip -> consecutive windows above threshold
 
         self._open_logs(env("DHBS_OUT_DIR"))
-        self.logger.info("DHBS started: mode=%s threshold=%.1f pps poll=%.1fs strikes=%d",
-                         self.mode, self.threshold, self.poll, self.strikes_needed)
+        self.logger.info("DHBS started: mode=%s threshold=%.1f pps poll=%.1fs strikes=%d block_seconds=%.1f",
+                         self.mode, self.threshold, self.poll, self.strikes_needed, self.block_seconds)
         self._log_event("CONTROLLER_START", "-", 0.0)
         hub.spawn(self._monitor)
 
@@ -118,11 +124,21 @@ class DHBSController(BaseClass):
         actions = [parser.OFPActionOutput(ofp.OFPP_CONTROLLER, ofp.OFPCML_NO_BUFFER)]
         self.add_flow(dp, 0, match, actions)
 
-    def add_flow(self, dp, priority, match, actions, idle=0):
+    def add_flow(self, dp, priority, match, actions, idle=0, hard=0):
         ofp, parser = dp.ofproto, dp.ofproto_parser
         inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=dp, priority=priority, match=match,
-                                instructions=inst, idle_timeout=idle)
+                                instructions=inst, idle_timeout=idle, hard_timeout=hard)
+        dp.send_msg(mod)
+
+    def delete_block_flow(self, dp, ip):
+        """Delete only this host's priority-100 DROP entry."""
+        ofp, parser = dp.ofproto, dp.ofproto_parser
+        match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
+        mod = parser.OFPFlowMod(
+            datapath=dp, command=ofp.OFPFC_DELETE_STRICT,
+            priority=PRIO_DROP, match=match,
+            out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY)
         dp.send_msg(mod)
 
     # ------------------------------------------------------- learning switch
@@ -163,8 +179,25 @@ class DHBSController(BaseClass):
     def _monitor(self):
         while True:
             hub.sleep(self.poll)
+            self._expire_blocks()
             for dp in list(self.datapaths.values()):
                 dp.send_msg(dp.ofproto_parser.OFPFlowStatsRequest(dp))
+
+    def _expire_blocks(self):
+        """Remove expired blocks and re-arm detection for those hosts."""
+        now = time.monotonic()
+        for ip, (dpid, expires_at) in list(self.blocked_until.items()):
+            if now < expires_at:
+                continue
+            dp = self.datapaths.get(dpid)
+            if dp is not None:
+                self.delete_block_flow(dp, ip)
+            self.blocked_until.pop(ip, None)
+            self.blocklist.discard(ip)
+            self.detected.discard(ip)
+            self.strikes[ip] = 0
+            self.logger.info("*** UNBLOCKED %s : temporary block expired ***", ip)
+            self._log_event("UNBLOCKED", ip, 0.0)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def on_flow_stats(self, ev):
@@ -206,6 +239,8 @@ class DHBSController(BaseClass):
                         self._log_event("NOT_BLOCKED_BASELINE", ip, pps)
             else:
                 self.strikes[ip] = 0
+                # A later independent burst can be detected again.
+                self.detected.discard(ip)
         return to_block
 
     # -------------------------------------------------------------- blocking
@@ -215,7 +250,14 @@ class DHBSController(BaseClass):
         parser = dp.ofproto_parser
         self.blocklist.add(ip)
         match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip)
-        self.add_flow(dp, PRIO_DROP, match, [])      # no actions = DROP
-        self.logger.warning("*** BLOCKED %s : OpenFlow DROP rule installed (priority %d) ***",
-                            ip, PRIO_DROP)
+        # hard_timeout is enforced by OVS even if the controller is briefly busy.
+        hard_timeout = min(65535, int(self.block_seconds)) if self.block_seconds > 0 else 0
+        self.add_flow(dp, PRIO_DROP, match, [], hard=hard_timeout)  # no actions = DROP
+        if self.block_seconds > 0:
+            self.blocked_until[ip] = (dp.id, time.monotonic() + self.block_seconds)
+            self.logger.warning("*** BLOCKED %s for %.1f seconds (priority %d) ***",
+                                ip, self.block_seconds, PRIO_DROP)
+        else:
+            self.logger.warning("*** BLOCKED %s permanently (priority %d) ***", ip, PRIO_DROP)
         self._log_event("BLOCKED", ip, 0.0)
+
